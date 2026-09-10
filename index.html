@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>SX033A BLE 診断</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#111;color:#eee}
+    main{max-width:720px;margin:auto;padding:20px}
+    h1{font-size:24px}
+    .card{background:#1c1c1e;border-radius:16px;padding:16px;margin:14px 0}
+    button{width:100%;padding:14px;border:0;border-radius:12px;font-size:17px;margin:6px 0}
+    #connect{background:#0a84ff;color:#fff}
+    #disconnect{background:#333;color:#fff}
+    .ok{color:#30d158}.bad{color:#ff453a}.muted{color:#aaa}
+    pre{white-space:pre-wrap;word-break:break-word;background:#000;padding:12px;border-radius:12px;min-height:180px}
+  </style>
+</head>
+<body>
+<main>
+  <h1>SX033A BLE 診断</h1>
+  <p class="muted">接続とNotify受信だけを行います。この版は機器へ操作コマンドを書き込みません。</p>
+
+  <div class="card">
+    <button id="connect">SX033A に接続</button>
+    <button id="disconnect" disabled>切断</button>
+    <p>状態: <span id="status">未接続</span></p>
+  </div>
+
+  <div class="card">
+    <strong>検出結果</strong>
+    <p>FFE1 (Write Without Response): <span id="ffe1">未確認</span></p>
+    <p>FFE2 (Notify): <span id="ffe2">未確認</span></p>
+    <p>FFF3 (Write): <span id="fff3">未確認</span></p>
+  </div>
+
+  <div class="card">
+    <strong>FFE2 Notify ログ</strong>
+    <pre id="log">まだ受信していません。</pre>
+  </div>
+</main>
+
+<script>
+const BASE = x => `0000${x}-0000-1000-8000-00805f9b34fb`;
+const SERVICE = BASE('ffe0');
+const UUID_FFE1 = BASE('ffe1');
+const UUID_FFE2 = BASE('ffe2');
+const UUID_FFF3 = BASE('fff3');
+
+let device, server, notifyChar;
+
+const $ = id => document.getElementById(id);
+function setText(id, text, cls='') {
+  const e=$(id); e.textContent=text; e.className=cls;
+}
+function hex(dataView){
+  return [...new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength)]
+    .map(b=>b.toString(16).padStart(2,'0').toUpperCase()).join(' ');
+}
+function addLog(s){
+  const p=$('log');
+  if(p.textContent==='まだ受信していません。') p.textContent='';
+  const t=new Date().toLocaleTimeString();
+  p.textContent += `[${t}] ${s}\n`;
+  p.scrollTop=p.scrollHeight;
+}
+function onNotify(e){
+  addLog(hex(e.target.value));
+}
+
+$('connect').onclick = async () => {
+  try {
+    if(!navigator.bluetooth) throw new Error('このブラウザではWeb Bluetoothが利用できません。Bluefyで開いてください。');
+
+    setText('status','機器を選択してください…','muted');
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'SX033A' }],
+      optionalServices: [SERVICE]
+    });
+
+    device.addEventListener('gattserverdisconnected', () => {
+      setText('status','切断されました','bad');
+      $('connect').disabled=false;
+      $('disconnect').disabled=true;
+    });
+
+    server = await device.gatt.connect();
+    setText('status',`${device.name || 'SX033A'} 接続済み`,'ok');
+
+    const service = await server.getPrimaryService(SERVICE);
+
+    try {
+      await service.getCharacteristic(UUID_FFE1);
+      setText('ffe1','見つかりました','ok');
+    } catch {
+      setText('ffe1','見つかりません','bad');
+    }
+
+    try {
+      notifyChar = await service.getCharacteristic(UUID_FFE2);
+      setText('ffe2','見つかりました / Notify開始中','ok');
+      notifyChar.addEventListener('characteristicvaluechanged', onNotify);
+      await notifyChar.startNotifications();
+      setText('ffe2','見つかりました / Notify有効','ok');
+      addLog('FFE2 Notify を開始しました');
+    } catch (e) {
+      setText('ffe2','Notify開始失敗','bad');
+      addLog('FFE2 ERROR: ' + e.message);
+    }
+
+    try {
+      await service.getCharacteristic(UUID_FFF3);
+      setText('fff3','見つかりました','ok');
+    } catch {
+      setText('fff3','見つかりません','bad');
+    }
+
+    $('connect').disabled=true;
+    $('disconnect').disabled=false;
+  } catch(e) {
+    setText('status','エラー','bad');
+    addLog('ERROR: ' + (e?.message || e));
+  }
+};
+
+$('disconnect').onclick = () => {
+  try {
+    if(device?.gatt?.connected) device.gatt.disconnect();
+  } catch {}
+};
+</script>
+</body>
+</html>
