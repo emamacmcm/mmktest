@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>みみき AI Ver.4</title>
+<style>
+:root{
+  --bg:#f8f5fc;--card:#fff;--ink:#2c2932;--muted:#8c8595;
+  --accent:#7d68aa;--accent2:#ddd4ed;--danger:#d94c63;--grid:#eee8f4
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Noto Sans JP",sans-serif}
+.app{max-width:520px;margin:auto;min-height:100dvh}
+header{position:sticky;top:0;z-index:5;padding:14px 16px 10px;background:rgba(248,245,252,.94);backdrop-filter:blur(12px)}
+.top{display:flex;align-items:center;gap:10px}
+.title{font-size:19px;font-weight:850;flex:1}
+.pill{font-size:12px;background:#eee8f7;color:#6a5b86;padding:7px 10px;border-radius:999px}
+button{font:inherit}
+.connect{border:0;background:#fff;border-radius:12px;padding:9px 12px;box-shadow:0 2px 10px #0001}
+.panel{margin:0 14px 12px;background:#fff;border-radius:20px;padding:14px;box-shadow:0 5px 20px #0000000b}
+.status{display:flex;align-items:end;gap:7px}
+.strength{font-size:36px;font-weight:900;line-height:1}
+.of{font-size:14px;color:var(--muted);padding-bottom:5px}
+.mode{margin-left:auto;color:#6e6087;font-weight:750;font-size:13px}
+canvas{width:100%;height:190px;display:block;margin-top:8px}
+.legend{display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}
+.stop{width:100%;border:0;border-radius:14px;padding:13px;margin-top:12px;background:var(--danger);color:white;font-weight:850}
+.ble{margin:0 16px 8px;text-align:center;color:var(--muted);font-size:11px}
+.messages{padding:6px 14px 100px;display:flex;flex-direction:column;gap:10px}
+.bubble{max-width:82%;padding:11px 13px;border-radius:18px;font-size:14px;line-height:1.5;white-space:pre-wrap}
+.ai{align-self:flex-start;background:#fff;border-bottom-left-radius:5px}
+.me{align-self:flex-end;background:#dfd7ee;border-bottom-right-radius:5px}
+.action{margin-top:5px;color:#75658f;font-size:11px;font-weight:750}
+.composer{position:fixed;left:50%;bottom:0;transform:translateX(-50%);width:min(520px,100%);padding:10px 12px calc(10px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:end;background:linear-gradient(transparent,#f8f5fc 25%)}
+textarea{flex:1;resize:none;max-height:110px;border:1px solid #e9e1f0;border-radius:19px;padding:12px 14px;background:white;outline:none;font:inherit}
+.send{width:44px;height:44px;border:0;border-radius:50%;background:var(--accent);color:white;font-size:20px}
+.small{font-size:11px;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+  <div class="top">
+    <div class="title">みみき AI</div>
+    <div class="pill">みみきモード</div>
+    <button class="connect" id="connect">Bluetooth接続</button>
+  </div>
+</header>
+
+<section class="panel">
+  <div class="status">
+    <div class="strength" id="strength">0</div><div class="of">/ 10</div>
+    <div class="mode" id="label">停止</div>
+  </div>
+  <canvas id="graph"></canvas>
+  <div class="legend"><span>0 停止</span><span>実用範囲 5〜10</span><span>10 最大</span></div>
+  <button class="stop" id="stop">緊急停止</button>
+  <div class="small">起動時は0。チャットで「みみきモード」と送ると5から開始します。</div>
+</section>
+
+<div class="ble" id="bleState">未接続</div>
+
+<main class="messages" id="messages">
+  <div class="bubble ai">待機中。Bluetoothを接続して「みみきモード」と送ってね。<div class="action">強度 0 / 10・停止</div></div>
+</main>
+
+<div class="composer">
+  <textarea id="input" rows="1" placeholder="例：みみきモード / 10にして / 少し弱く / 止めて"></textarea>
+  <button class="send" id="send">↑</button>
+</div>
+</div>
+
+<script>
+const SERVICE='0000ffe0-0000-1000-8000-00805f9b34fb';
+const FFE1='0000ffe1-0000-1000-8000-00805f9b34fb';
+const FFE2='0000ffe2-0000-1000-8000-00805f9b34fb';
+
+let bleDevice=null, writeChar=null, notifyChar=null;
+let level=0, modeEnabled=false, sendTimer=null;
+let history=Array(70).fill(0);
+
+const $=s=>document.querySelector(s);
+const canvas=$('#graph'), ctx=canvas.getContext('2d');
+
+function labelFor(v){
+  if(v===0)return '停止';
+  if(v===5)return '弱';
+  if(v===6)return 'やや弱';
+  if(v===7)return '中';
+  if(v===8)return 'やや強';
+  if(v===9)return '強';
+  return '最大';
+}
+
+function toDeviceByte(v){
+  if(v<=0)return 0;
+  // みみきは下半分では反応しにくいため、5→約50%、10→100%に対応
+  return Math.max(128, Math.min(255, Math.round((v/10)*255)));
+}
+
+function scalePacket(v){
+  return new Uint8Array([0x55,0x04,0x00,0x00,0x01,toDeviceByte(v),0xAA]);
+}
+function stopPacket(){
+  return new Uint8Array([0x55,0x04,0x00,0x00,0x00,0x00,0xAA]);
+}
+
+async function writePacket(bytes){
+  if(!writeChar) throw new Error('Bluetooth未接続です');
+  if(writeChar.properties.writeWithoutResponse){
+    await writeChar.writeValueWithoutResponse(bytes);
+  }else if(writeChar.properties.write){
+    await writeChar.writeValueWithResponse(bytes);
+  }else{
+    throw new Error('FFE1に書き込みできません');
+  }
+}
+
+function stopRepeating(){
+  if(sendTimer){ clearInterval(sendTimer); sendTimer=null; }
+}
+
+async function beginRepeating(){
+  stopRepeating();
+  if(level<=0 || !writeChar)return;
+  try{ await writePacket(scalePacket(level)); }catch(e){ setBleError(e); return; }
+  // 公式アプリのFree/Touch系と同じく定期的にリアルタイム制御値を送る
+  sendTimer=setInterval(async()=>{
+    if(level<=0 || !writeChar){stopRepeating();return;}
+    try{ await writePacket(scalePacket(level)); }
+    catch(e){ stopRepeating(); setBleError(e); }
+  },120);
+}
+
+function setBleError(e){
+  $('#bleState').textContent='送信エラー: '+(e?.message||e);
+}
+
+async function setLevel(v, send=true){
+  v=Number(v);
+  if(!Number.isFinite(v))return;
+  if(v<=0) v=0;
+  else v=Math.max(5,Math.min(10,Math.round(v)));
+  level=v;
+  $('#strength').textContent=v;
+  $('#label').textContent=labelFor(v);
+
+  if(!send)return;
+  if(v===0){
+    stopRepeating();
+    if(writeChar){
+      try{ await writePacket(stopPacket()); $('#bleState').textContent=(bleDevice?.name||'SX033A')+' 接続済み・停止命令送信'; }
+      catch(e){ setBleError(e); }
+    }
+  }else{
+    await beginRepeating();
+    if(writeChar) $('#bleState').textContent=(bleDevice?.name||'SX033A')+' 接続済み・強度 '+v+' 送信中';
+  }
+}
+
+function resize(){
+  const dpr=window.devicePixelRatio||1,r=canvas.getBoundingClientRect();
+  canvas.width=r.width*dpr;canvas.height=r.height*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);draw();
+}
+function draw(){
+  const w=canvas.clientWidth,h=canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle='#eee8f4';ctx.lineWidth=1;
+  for(let v=0;v<=10;v+=2){
+    const y=h-12-(v/10)*(h-24);
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();
+  }
+  const y5=h-12-.5*(h-24);
+  ctx.setLineDash([5,5]);ctx.strokeStyle='#c7badb';
+  ctx.beginPath();ctx.moveTo(0,y5);ctx.lineTo(w,y5);ctx.stroke();ctx.setLineDash([]);
+
+  const pts=history.map((v,i)=>[
+    i/(history.length-1)*w,
+    h-12-(v/10)*(h-24)
+  ]);
+  ctx.strokeStyle='#7d68aa';ctx.lineWidth=4;ctx.lineJoin='round';ctx.lineCap='round';
+  ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.stroke();
+  const p=pts[pts.length-1];
+  ctx.fillStyle='#7d68aa';ctx.beginPath();ctx.arc(p[0],p[1],5.5,0,Math.PI*2);ctx.fill();
+}
+// 動画のように常に右へ流れる
+setInterval(()=>{
+  history.push(level);
+  history.shift();
+  draw();
+},140);
+
+function add(text,who,action=''){
+  const b=document.createElement('div');
+  b.className='bubble '+who;
+  b.textContent=text;
+  if(action){
+    const a=document.createElement('div');
+    a.className='action';a.textContent=action;b.appendChild(a);
+  }
+  $('#messages').appendChild(b);
+  b.scrollIntoView({behavior:'smooth',block:'end'});
+}
+
+function parseRequestedLevel(text){
+  const t=text.replace(/[０-９]/g,c=>String.fromCharCode(c.charCodeAt(0)-0xFEE0));
+
+  if(/緊急停止|止めて|とめて|ストップ|stop|停止/i.test(t)) return 0;
+  if(/最大|マックス|max/i.test(t)) return 10;
+
+  // 「10にして」「7」「強度8」など
+  const m=t.match(/(?:強度\s*)?(10|[0-9])(?:\s*(?:に|で|くらい|ぐらい))?/);
+  if(m){
+    const n=Number(m[1]);
+    if(n===0)return 0;
+    if(n>=1 && n<=4)return 5; // みみき実用下限
+    if(n>=5 && n<=10)return n;
+  }
+
+  if(/もっと.*強|強く|上げて|あげて/.test(t)) return Math.min(10, Math.max(5,level||5)+1);
+  if(/もっと.*弱|弱く|下げて|さげて/.test(t)) return Math.max(5,(level||6)-1);
+
+  return null;
+}
+
+async function handleMessage(t){
+  if(/みみき\s*モード/.test(t)){
+    modeEnabled=true;
+    if(!writeChar){
+      add('みみきモードを開始する準備はできたよ。先にBluetoothを接続してね。','ai','強度 0 / 10・停止');
+      return;
+    }
+    await setLevel(5,true);
+    add('みみきモード開始。弱めの5から動かすね。','ai','強度 5 / 10・弱');
+    return;
+  }
+
+  const requested=parseRequestedLevel(t);
+  if(requested!==null){
+    if(requested>0 && !modeEnabled){
+      add('先に「みみきモード」と送って開始してね。','ai','強度 0 / 10・停止');
+      return;
+    }
+    await setLevel(requested,true);
+    if(requested===0){
+      add('停止したよ。','ai','強度 0 / 10・停止');
+    }else if(requested===10){
+      add('10、最大にするね。','ai','強度 10 / 10・最大');
+    }else{
+      add(`${requested}にするね。`,'ai',`強度 ${requested} / 10・${labelFor(requested)}`);
+    }
+    return;
+  }
+
+  add('今の強さを保つね。数字なら「10にして」のように指定できるよ。','ai',`強度 ${level} / 10・${labelFor(level)}`);
+}
+
+async function sendMessage(){
+  const t=$('#input').value.trim();
+  if(!t)return;
+  add(t,'me');$('#input').value='';
+  await handleMessage(t);
+}
+$('#send').onclick=sendMessage;
+$('#input').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMessage();}
+});
+
+$('#stop').onclick=async()=>{
+  modeEnabled=false;
+  await setLevel(0,true);
+  add('緊急停止しました。','ai','強度 0 / 10・停止');
+};
+
+$('#connect').onclick=async()=>{
+  try{
+    if(!navigator.bluetooth) throw new Error('Web Bluetoothに対応したブラウザで開いてください');
+    bleDevice=await navigator.bluetooth.requestDevice({
+      filters:[{name:'SX033A'}],
+      optionalServices:[SERVICE]
+    });
+    if(bleDevice.name!=='SX033A') throw new Error('SX033A以外は接続しません');
+
+    bleDevice.addEventListener('gattserverdisconnected',()=>{
+      writeChar=null;notifyChar=null;stopRepeating();
+      $('#connect').textContent='Bluetooth接続';
+      $('#bleState').textContent='切断されました';
+    });
+
+    const server=await bleDevice.gatt.connect();
+    const service=await server.getPrimaryService(SERVICE);
+    writeChar=await service.getCharacteristic(FFE1);
+
+    try{
+      notifyChar=await service.getCharacteristic(FFE2);
+      if(notifyChar.properties.notify) await notifyChar.startNotifications();
+    }catch(_){}
+
+    $('#connect').textContent='接続済み';
+    $('#bleState').textContent='SX033A 接続済み・現在は停止';
+    // 接続しただけでは動かさない。明示的な「みみきモード」まで0のまま
+    await setLevel(0,true);
+  }catch(e){
+    writeChar=null;notifyChar=null;stopRepeating();
+    $('#bleState').textContent='接続失敗: '+(e?.message||e);
+  }
+};
+
+document.addEventListener('visibilitychange',async()=>{
+  if(document.hidden){
+    stopRepeating();
+    if(writeChar){
+      try{await writePacket(stopPacket());}catch(_){}
+    }
+    level=0;modeEnabled=false;
+    $('#strength').textContent='0';$('#label').textContent='停止';
+  }
+});
+
+window.addEventListener('beforeunload',()=>{
+  stopRepeating();
+});
+
+resize();
+</script>
+</body>
+</html>
